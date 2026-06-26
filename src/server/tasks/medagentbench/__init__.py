@@ -7,6 +7,10 @@ from .eval import eval
 import time
 import json
 import importlib
+import re
+
+#Models sometimes prefix the command with reasoning prose; this finds the first real command keyword.
+_CMD_START = re.compile(r'(GET |POST |FINISH\()')
 
 MedAgentBench_prompt = """You are an expert in using FHIR functions to assist medical professionals. You are given a question and a set of possible functions. Based on the question, you will need to make one or more function/tool calls to achieve the purpose.
 
@@ -72,6 +76,9 @@ class MedAgentBench(Task):
                     history=session.history
                 )
                 r = res.content.strip().replace('```tool_code', '').replace('```', '').strip() #Remove separator for Gemini2.0Flash
+                m = _CMD_START.search(r)
+                if m:
+                    r = r[m.start():]
 
                 if r.startswith('GET'):
                     url = r[3:].strip() + '&_format=json'
