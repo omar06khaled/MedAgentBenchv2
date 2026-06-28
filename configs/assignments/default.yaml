@@ -4,7 +4,7 @@ concurrency:
   task:
     medagentbench-std: 20
   agent:
-    gpt-4o-mini: 10
+    gpt-4o-mini: 5
     gpt-4o: 10
     o1-mini: 10
     gemini-2.0: 1
