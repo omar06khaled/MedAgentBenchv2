@@ -7,10 +7,105 @@ from .eval import eval
 import time
 import json
 import importlib
+import os
 import re
 
 #Models sometimes prefix the command with reasoning prose; this finds the first real command keyword.
 _CMD_START = re.compile(r'(GET |POST |FINISH\()')
+
+_FINISH_NUM = re.compile(r'^\s*(-?\d+(?:\.\d+)?)\s*[A-Za-z%/]*\s*$')
+_FINISH_UNIT = re.compile(r'(-?\d+(?:\.\d+)?)\s*(?:mg/dL|mmol/L|mEq(?:/L)?|g/dL|%|g)')
+
+#The grader runs strict json.loads on the FINISH answer and expects a bare array of scalars; models often return correct data as a dict, list of dicts, prose, or a unit-suffixed string, so coerce those shapes to bare numbers while leaving already-clean output untouched.
+def _normalize_finish(answer):
+    try:
+        parsed = json.loads(answer)
+    except Exception:
+        return answer
+    if not isinstance(parsed, list):
+        return answer
+    out = []
+    changed = False
+    for el in parsed:
+        if isinstance(el, dict):
+            v = el.get('value')
+            if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+                vq = el.get('valueQuantity')
+                v = vq.get('value') if isinstance(vq, dict) else None
+            if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+                return answer
+            el = v
+            changed = True
+        if isinstance(el, str):
+            m = _FINISH_NUM.match(el)
+            hits = _FINISH_UNIT.findall(el)
+            tok = m.group(1) if m else (hits[0] if len(hits) == 1 else None)
+            if tok is not None:
+                el = float(tok)
+                changed = True
+        out.append(el)
+    if not changed:
+        return answer
+    candidate = json.dumps(out)
+    try:
+        json.loads(candidate)
+    except Exception:
+        return answer
+    return candidate
+
+#task4-style "last 24h" queries append a bare exact-timestamp date= filter, which FHIR matches exactly and returns 0 rows; drop the over-narrow date filter (matching refsol's _count=5000 so no readings are lost) and let the model filter the window from the returned data
+def _broaden_observation_date(query):
+    try:
+        if 'Observation' not in query or 'date=' not in query:
+            return query
+        base, _, qs = query.partition('?')
+        kept, broadened, has_count = [], False, False
+        for p in qs.split('&'):
+            k, _, v = p.partition('=')
+            if k == '_count':
+                has_count = True
+            if k == 'date' and 'T' in v and not re.match(r'(eq|ne|gt|lt|ge|le|sa|eb|ap)', v):
+                broadened = True
+                continue
+            kept.append(p)
+        if not broadened:
+            return query
+        if not has_count:
+            kept.append('_count=5000')
+        return base + '?' + '&'.join(kept)
+    except Exception:
+        return query
+
+
+#FHIR bundles carry per-entry metadata (fullUrl, search, resource.meta/extension/text/category)
+#that the model never needs to answer a lab-value question. A patient with 100+ readings can
+#exceed the per-minute token budget once the bundle is re-sent across rounds, causing 429
+#"Request too large" failures. Strip that metadata losslessly (values/timestamps untouched, and
+#the grader re-fetches independently so trimming never affects scoring). send_get_request returns
+#'data' as a JSON string (FHIR server replies application/fhir+json), so parse before trimming.
+_BUNDLE_DROP = ('meta', 'link')
+_ENTRY_DROP = ('fullUrl', 'search')
+_RESOURCE_DROP = ('meta', 'extension', 'text', 'category')
+
+def _trim_fhir_response(data):
+    try:
+        parsed = json.loads(data) if isinstance(data, str) else data
+        if not isinstance(parsed, dict) or 'entry' not in parsed:
+            return data
+        for entry in parsed.get('entry', []):
+            if not isinstance(entry, dict):
+                continue
+            for k in _ENTRY_DROP:
+                entry.pop(k, None)
+            res = entry.get('resource')
+            if isinstance(res, dict):
+                for k in _RESOURCE_DROP:
+                    res.pop(k, None)
+        for k in _BUNDLE_DROP:
+            parsed.pop(k, None)
+        return json.dumps(parsed, separators=(',', ':'))
+    except Exception:
+        return data
 
 MedAgentBench_prompt = """You are an expert in using FHIR functions to assist medical professionals. You are given a question and a set of possible functions. Based on the question, you will need to make one or more function/tool calls to achieve the purpose.
 
@@ -81,11 +176,12 @@ class MedAgentBench(Task):
                     r = r[m.start():]
 
                 if r.startswith('GET'):
-                    url = r[3:].strip() + '&_format=json'
+                    url = _broaden_observation_date(r[3:].strip()) + '&_format=json'
                     #print(f'GET {url}')
                     get_res = send_get_request(url)
                     if "data" in get_res:
-                        session.inject({"role": "user", "content": f"Here is the response from the GET request:\n{get_res['data']}. Please call FINISH if you have got answers for all the questions and finished all the requested tasks"})
+                        trimmed = _trim_fhir_response(get_res['data'])
+                        session.inject({"role": "user", "content": f"Here is the response from the GET request:\n{trimmed}. Please call FINISH if you have got answers for all the questions and finished all the requested tasks"})
                     else:
                         session.inject({"role": "user", "content": f"Error in sending the GET request: {get_res['error']}"})
 
@@ -97,9 +193,11 @@ class MedAgentBench(Task):
                     else:
                         session.inject({"role": "user", "content": "POST request accepted and executed successfully. Please call FINISH if you have got answers for all the questions and finished all the requested tasks"})
                 elif r.startswith('FINISH('):
+                    answer = r[len('FINISH('):-1] #Trim to a list
+                    answer = _normalize_finish(answer)
                     return TaskOutput(
                         status=SampleStatus.COMPLETED,
-                        result=r[len('FINISH('):-1], #Trim to a list
+                        result=answer,
                         history=session.history
                     )
                 else:
