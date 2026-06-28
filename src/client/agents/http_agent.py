@@ -137,28 +137,29 @@ class Prompter:
 
 def check_context_limit(content: str):
     content = content.lower()
-    and_words = [
-        ["prompt", "context", "tokens"],
-        [
-            "limit",
-            "exceed",
-            "max",
-            "long",
-            "much",
-            "many",
-            "reach",
-            "over",
-            "up",
-            "beyond",
-        ],
-    ]
-    rule = AndRule(
-        [
-            OrRule([ContainRule(word) for word in and_words[i]])
-            for i in range(len(and_words))
-        ]
+    # Only TRUE context-overflow errors are non-retryable and should abort the sample.
+    # OpenAI 429 rate-limit bodies ("rate limit reached ... tokens per min (TPM)",
+    # "please try again in ...") must NOT match here -- otherwise transient throttling
+    # is misreported as a fatal context limit and the sample dies with zero retries.
+    rate_limit_sigs = (
+        "rate limit",
+        "tokens per min",
+        "requests per min",
+        "tpm",
+        "rpm",
+        "try again",
+        "too many requests",
     )
-    return rule.check(content)
+    if any(s in content for s in rate_limit_sigs):
+        return False
+    context_sigs = (
+        "context_length_exceeded",
+        "maximum context length",
+        "reduce the length",
+        "please reduce",
+        "string too long",
+    )
+    return any(s in content for s in context_sigs)
 
 
 class HTTPAgent(AgentClient):
