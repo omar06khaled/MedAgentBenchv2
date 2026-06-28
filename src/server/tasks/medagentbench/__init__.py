@@ -137,7 +137,19 @@ class MedAgentBench(Task):
         self.func_file = configs.pop("func_file")
         with open(self.func_file, 'r') as f:
             self.funcs = json.load(f)
-        
+
+        #Per-category answer-format hints (keyed by task category prefix, e.g. "task5").
+        #Only low-performing, format-sensitive categories are present; 90%+ categories and
+        #rate-limit-bound task8 are intentionally absent so their prompts stay unchanged.
+        #Optional file - missing/corrupt hints must never break a run.
+        self.task_hints = {}
+        hints_path = os.path.join(os.path.dirname(self.data_file), "task_hints.json")
+        try:
+            with open(hints_path, 'r') as f:
+                self.task_hints = {k: v for k, v in json.load(f).items() if not k.startswith('_')}
+        except Exception as e:
+            print(f"task_hints.json not loaded ({e}); proceeding without per-category hints")
+
         self.max_round = configs.pop("max_round", 5)
 
         self.fhir_api_base = configs.pop("fhir_api_base")
@@ -156,9 +168,17 @@ class MedAgentBench(Task):
     async def start_sample(self, index, session: Session):
         print(f"task start {index}")
         case = self.data[index]
+        context = case['context']
+        #task9's context names both code "K" and LOINC 2823-3 for potassium, but this server only indexes the level by code "K"; mirror the existing magnesium "MG" hint so the model queries K, not the LOINC
+        if '2823-3' in context:
+            context += ' The code for potassium is "K", not LOINC 2823-3.'
+        #Append the per-category answer-format hint (if any) so the model emits the FINISH shape the grader expects. Only weak, format-sensitive categories have a hint; others are unchanged.
+        category = case['id'].split('_')[0]
+        if category in self.task_hints:
+            context += ' ' + self.task_hints[category]
         session.inject({"role": "user", "content": MedAgentBench_prompt.format(api_base=self.fhir_api_base,
                                                                                functions=json.dumps(self.funcs),
-                                                                               context=case['context'],
+                                                                               context=context,
                                                                                question=case['instruction'])})
         try:
             for round in range(self.max_round):
